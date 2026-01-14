@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
+# THIS IS src/heretic/config.py
 
 from enum import Enum
 from typing import Dict
@@ -16,7 +17,8 @@ from pydantic_settings import (
 class QuantizationMethod(str, Enum):
     NONE = "none"
     BNB_4BIT = "bnb_4bit"
-
+    GPTQ = "local-gptq"
+    AGPTQ = 'gptq'
 
 class DatasetSpecification(BaseModel):
     dataset: str = Field(
@@ -96,6 +98,21 @@ class Settings(BaseSettings):
         default=QuantizationMethod.NONE,
         description="Quantization method to use when loading the model. Options: 'none' (no quantization), 'bnb_4bit' (4-bit quantization using bitsandbytes).",
     )
+    
+    gptq_bits: int = Field(
+        default=4,
+        description="Number of bits for GPTQ quantization (2, 3, 4, or 8). Only used when quantization='gptq'.",
+    )
+    
+    gptq_group_size: int = Field(
+        default=128,
+        description="Group size for GPTQ quantization. -1 for per-channel quantization. Only used when quantization='gptq'.",
+    )
+    
+    gptq_desc_act: bool = Field(
+        default=True,
+        description="Whether to use desc_act (activation order) for GPTQ. Improves quality but slower. Only used when quantization='gptq'.",
+    )
 
     batch_size: int = Field(
         default=0,  # auto
@@ -156,6 +173,36 @@ class Settings(BaseSettings):
             "The KL divergence to target. Below this value, an objective based on the refusal count is used."
             'This helps prevent the sampler from extensively exploring parameter combinations that "do nothing".'
         ),
+    )
+    
+    study_name: str = Field(
+        default="slop_reduction_study",
+        description="Name for the Optuna study (used when saving/resuming).",
+    )
+    
+    storage: str | None = Field(
+        default=None,
+        description="Storage URL for Optuna (e.g., 'sqlite:///heretic_trials.db' for SQLite).",
+    )
+    
+    load_existing_study: bool = Field(
+        default=True,
+        description="Whether to load an existing study if one exists.",
+    )
+    
+    resume_trials: bool = Field(
+        default=True,
+        description="Whether to resume from existing trials and continue optimization.",
+    )
+    
+    checkpoint_dir: str = Field(
+        default="checkpoints",
+        description="Directory to save trial checkpoints for manual resuming.",
+    )
+    
+    checkpoint_interval: int = Field(
+        default=5,
+        description="Save checkpoint every N trials.",
     )
 
     n_trials: int = Field(

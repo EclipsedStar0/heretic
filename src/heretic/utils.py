@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
+# THIS IS src/heretic/utils.py
+
+from tqdm import tqdm
 
 import gc
 import getpass
@@ -207,8 +210,12 @@ T = TypeVar("T")
 
 
 def batchify(items: list[T], batch_size: int) -> list[list[T]]:
-    return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
-
+    #return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
+    return list(tqdm(
+        [items[i:i + batch_size] for i in range(0, len(items), batch_size)], 
+        desc="Batching",  # Optional description
+        total=len(items) // batch_size + (1 if len(items) % batch_size else 0)  # Total number of batches
+    ))
 
 def empty_cache():
     # Collecting garbage is not an idempotent operation, and to avoid OOM errors,
@@ -235,14 +242,14 @@ def empty_cache():
 def get_trial_parameters(trial: Trial) -> dict[str, str]:
     params = {}
 
-    direction_index = trial.user_attrs["direction_index"]
-    params["direction_index"] = (
-        "per layer" if (direction_index is None) else f"{direction_index:.2f}"
-    )
+    if "direction_index" in trial.user_attrs:
+        params["direction_index"] = trial.user_attrs["direction_index"]
 
-    for component, parameters in trial.user_attrs["parameters"].items():
-        for name, value in asdict(parameters).items():
-            params[f"{component}.{name}"] = f"{value:.2f}"
+    if "parameters" in trial.user_attrs:
+        parameters_dict = trial.user_attrs["parameters"]
+        for component, param_dict in parameters_dict.items():
+            for key, value in param_dict.items():
+                params[f"{component}.{key}"] = value
 
     return params
 

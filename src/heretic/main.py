@@ -1,5 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
+# THIS IS src/heretic/main.py
+
+import os
+
+# Disable torch.compile on Windows to avoid Unicode and compiler issues
+if os.name == 'nt':  # Windows
+    os.environ['TORCHDYNAMO_DISABLE'] = '1'
+
+
+
+from datetime import datetime
+import pickle
+import json
+import pandas as pd
 
 import math
 import os
@@ -50,6 +64,17 @@ from .utils import (
     prompt_text,
 )
 
+def get_trial_parameters_objects(trial: Trial) -> dict[str, AbliterationParameters]:
+    """Get AbliterationParameters objects from a trial."""
+    if "parameters" not in trial.user_attrs:
+        return {}
+    
+    parameters_dict = trial.user_attrs["parameters"]
+    return {
+        component: AbliterationParameters(**params_dict)
+        for component, params_dict in parameters_dict.items()
+    }
+
 
 def obtain_merge_strategy(settings: Settings) -> str | None:
     """
@@ -57,17 +82,22 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
     Returns "merge", "adapter", or None (if cancelled/invalid).
     """
     # Prompt for all PEFT models to ensure user is aware of merge implications
-    if settings.quantization == QuantizationMethod.BNB_4BIT:
+    if settings.quantization in [QuantizationMethod.BNB_4BIT, QuantizationMethod.GPTQ, QuantizationMethod.AGPTQ]:
         # Quantized models need special handling - we must reload the base model
         # in full precision to merge the LoRA adapters
         print()
         print(
             "[yellow]Model was loaded with quantization. Merging requires reloading the base model.[/]"
         )
-        print(
-            "[red](!) WARNING: CPU Merging requires dequantizing the entire model to System RAM.[/]"
-        )
-        print("[red]    This can lead to SYSTEM FREEZES if you run out of memory.[/]")
+        if settings.quantization in [QuantizationMethod.GPTQ, QuantizationMethod.AGPTQ]:
+            print(
+                "[yellow]Note: GPTQ models can stay quantized during merge, reducing memory requirements.[/]"
+            )
+        else:
+            print(
+                "[red](!) WARNING: CPU Merging requires dequantizing the entire model to System RAM.[/]"
+            )
+            print("[red]    This can lead to SYSTEM FREEZES if you run out of memory.[/]")
         print(
             "[yellow]    Rule of thumb: You need approx. 3x the parameter count in GB.[/]"
         )
@@ -127,6 +157,7 @@ def run():
         os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
     # Modified "Pagga" font from https://budavariam.github.io/asciiart-text/
+    print("Start Time: ", datetime.now())
     print(f"[cyan]█░█░█▀▀░█▀▄░█▀▀░▀█▀░█░█▀▀[/]  v{version('heretic-llm')}")
     print("[cyan]█▀█░█▀▀░█▀▄░█▀▀░░█░░█░█░░[/]")
     print(
@@ -219,14 +250,14 @@ def run():
     model = Model(settings)
 
     print()
-    print(f"Loading good prompts from [bold]{settings.good_prompts.dataset}[/]...")
+    print(f"Loading good prompts from [bold]{settings.good_prompts.dataset}[/] at {datetime.now()}...")
     good_prompts = load_prompts(settings, settings.good_prompts)
-    print(f"* [bold]{len(good_prompts)}[/] prompts loaded")
+    print(f"* [bold]{len(good_prompts)}[/] prompts loaded at {datetime.now()}")
 
     print()
-    print(f"Loading bad prompts from [bold]{settings.bad_prompts.dataset}[/]...")
+    print(f"Loading bad prompts from [bold]{settings.bad_prompts.dataset}[/] at {datetime.now()}...")
     bad_prompts = load_prompts(settings, settings.bad_prompts)
-    print(f"* [bold]{len(bad_prompts)}[/] prompts loaded")
+    print(f"* [bold]{len(bad_prompts)}[/] prompts loaded at {datetime.now()}")
 
     if settings.batch_size == 0:
         print()
@@ -237,9 +268,9 @@ def run():
         best_performance = -1
 
         while batch_size <= settings.max_batch_size:
-            print(f"* Trying batch size [bold]{batch_size}[/]... ", end="")
+            print(f"* Trying batch size [bold]{batch_size}[/] at {datetime.now()}... ", end="")
 
-            prompts = good_prompts * math.ceil(batch_size / len(good_prompts))
+            prompts = good_prompts * math.ceil((batch_size / len(good_prompts)) / 10)
             prompts = prompts[:batch_size]
 
             try:
@@ -275,8 +306,16 @@ def run():
         print(f"* Chosen batch size: [bold]{settings.batch_size}[/]")
 
     print()
-    print("Checking for common response prefix...")
+    print(f"Checking for common response prefix at {datetime.now()}...")
     responses = model.get_responses_batched(good_prompts[:100] + bad_prompts[:100])
+    with open('dumps/prefix_responses.pkl', 'wb') as file:
+        pickle.dump(responses, file)
+    #print("Loading from file...")
+    #with open("dumps/prefix_responses.pkl", 'rb') as file:
+    #    responses = pickle.load(file)
+    
+    #print(f"[INFO]: Manually skipping commonprefix check at {datetime.now()}")
+    #responses = []
 
     # Despite being located in os.path, commonprefix actually performs
     # a naive string operation without any path-specific logic,
@@ -284,7 +323,9 @@ def run():
     # to avoid issues where multiple different tokens that all start
     # with a space character lead to the common prefix ending with
     # a space, which would result in an uncommon tokenization.
+    
     model.response_prefix = commonprefix(responses).rstrip(" ")
+    #model.response_prefix = ""
 
     # Suppress CoT output.
     if model.response_prefix.startswith("<think>"):
@@ -309,7 +350,7 @@ def run():
 
     if settings.evaluate_model is not None:
         print()
-        print(f"Loading model [bold]{settings.evaluate_model}[/]...")
+        print(f"Loading model [bold]{settings.evaluate_model}[/] at {datetime.now()}...")
         settings.model = settings.evaluate_model
         model.reset_model()
         print("* Evaluating...")
@@ -318,10 +359,16 @@ def run():
 
     print()
     print("Calculating per-layer refusal directions...")
-    print("* Obtaining residuals for good prompts...")
+    print(f"* Obtaining residuals for good prompts at {datetime.now()}...")
     good_residuals = model.get_residuals_batched(good_prompts)
-    print("* Obtaining residuals for bad prompts...")
+    torch.save(good_residuals, 'dumps/good_residuals.pt')
+    #good_residuals = torch.load('dumps/good_residuals.pt')
+    
+    print(f"* Obtaining residuals for bad prompts at {datetime.now()}...")
     bad_residuals = model.get_residuals_batched(bad_prompts)
+    torch.save(bad_residuals, 'dumps/bad_residuals.pt')
+    #bad_residuals = torch.load('dumps/bad_residuals.pt')
+        
     refusal_directions = F.normalize(
         bad_residuals.mean(dim=0) - good_residuals.mean(dim=0),
         p=2,
@@ -412,20 +459,26 @@ def run():
             )
 
         trial.set_user_attr("direction_index", direction_index)
-        trial.set_user_attr("parameters", parameters)
+        
+        parameters_dict = {
+            component: params.to_dict()
+            for component, params in parameters.items()
+        }
+        trial.set_user_attr("parameters", parameters_dict)
 
         print()
         print(
-            f"Running trial [bold]{trial_index}[/] of [bold]{settings.n_trials}[/]..."
+            f"Running trial [bold]{trial_index}[/] of [bold]{settings.n_trials}[/] at {datetime.now()}..."
         )
         print("* Parameters:")
         for name, value in get_trial_parameters(trial).items():
             print(f"  * {name} = [bold]{value}[/]")
-        print("* Resetting model...")
+        print(f"* Resetting model at {datetime.now()}...")
         model.reset_model()
-        print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters)
-        print("* Evaluating...")
+        print(f"* Abliterating at {datetime.now()}...")
+        parameters_objects = get_trial_parameters_objects(trial)
+        model.abliterate(refusal_directions, direction_index, parameters_objects)
+        print(f"* Evaluating at {datetime.now()}...")
         score, kl_divergence, refusals = evaluator.get_score()
 
         elapsed_time = time.perf_counter() - start_time
@@ -446,28 +499,242 @@ def run():
 
     def objective_wrapper(trial: Trial) -> tuple[float, float]:
         try:
-            return objective(trial)
+            result = objective(trial)
+            
+            # Save trial results to disk
+            save_trial_results(trial, settings)
+            
+            return result
         except KeyboardInterrupt:
-            # Stop the study gracefully on Ctrl+C.
+            # Save before pruning
+            try:
+                if trial.state != TrialState.COMPLETE:
+                    save_trial_results(trial, settings)
+            except:
+                pass
             trial.study.stop()
             raise TrialPruned()
 
-    study = optuna.create_study(
-        sampler=TPESampler(
-            n_startup_trials=settings.n_startup_trials,
-            n_ei_candidates=128,
-            multivariate=True,
-        ),
-        directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
-    )
+    # Remove the conflicting backup loading code and just use the study loading from storage
+    if settings.storage:
+        try:
+            study = optuna.load_study(
+                study_name=settings.study_name or "heretic_study",
+                storage=settings.storage,
+                sampler=TPESampler(
+                    n_startup_trials=settings.n_startup_trials,
+                    n_ei_candidates=128,
+                    multivariate=True,
+                ),
+            )
+            print(f"[green]✓ Loaded existing study with {len(study.trials)} trials[/]")
+            
+            # Calculate remaining trials
+            completed_trials = len([t for t in study.trials if t.state == TrialState.COMPLETE])
+            remaining_trials = max(settings.n_trials - completed_trials, 0)
+            trial_index = completed_trials
+            
+            if remaining_trials > 0 and hasattr(settings, 'resume_trials') and settings.resume_trials:
+                print(f"[yellow]Resuming with {remaining_trials} additional trials to go[/]")
+                settings.n_trials = completed_trials + remaining_trials
+            else:
+                print(f"[yellow]Using existing {completed_trials} completed trials[/]")
+                
+        except KeyError:
+            # Study doesn't exist, create new
+            study = optuna.create_study(
+                study_name=settings.study_name or "heretic_study",
+                storage=settings.storage,
+                sampler=TPESampler(
+                    n_startup_trials=settings.n_startup_trials,
+                    n_ei_candidates=128,
+                    multivariate=True,
+                ),
+                directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
+            )
+            print("[green]✓ Created new study[/]")
+    else:
+        # For in-memory studies, keep simple backup logic
+        if os.path.exists("trials_backup.pkl"):
+            try:
+                with open("trials_backup.pkl", "rb") as f:
+                    existing_trials = pickle.load(f)
+                
+                # Simple resume for in-memory studies
+                for trial_data in existing_trials:
+                    # Get the value from whichever field it's stored in
+                    value = trial_data.get('value') or trial_data.get('score')
+                    if value is None:
+                        continue
+                        
+                    trial = optuna.trial.create_trial(
+                        params=trial_data.get('params', {}),
+                        distributions={k: optuna.distributions.FloatDistribution(0, 1) for k in trial_data.get('params', {})},
+                        value=value,
+                        user_attrs=trial_data.get('user_attrs', {}),
+                    )
+                    study.add_trial(trial)
+                
+                print(f"[green]Resumed {len(existing_trials)} trials from backup[/]")
+            except Exception as e:
+                print(f"[yellow]Could not load backup: {e}[/]")
 
+    # And add this to periodically backup during optimization
+    if trial_index % 5 == 0:  # Backup every 5 trials
+        backup_trials = []
+        for t in study.trials:
+            if t.state == TrialState.COMPLETE:
+                backup_trials.append({
+                    'trial_id': t.number,
+                    'user_attrs': dict(t.user_attrs),
+                    'params': t.params,
+                    'distributions': dict(t.distributions),
+                    'datetime': datetime.now().isoformat(),
+                })
+        
+        with open("trials_backup.pkl", "wb") as f:
+            pickle.dump(backup_trials, f)
+
+    def load_trials_from_files(study: optuna.study.Study, settings: Settings, trials_dir: Path = Path("trial_results")):
+        """Manually add trials from saved files to a study."""
+        if not trials_dir.exists():
+            return
+        
+        summary_file = trials_dir / "trials_summary.csv"
+        if not summary_file.exists():
+            return
+        
+        df = pd.read_csv(summary_file)
+        
+        for _, row in df.iterrows():
+            trial_file = trials_dir / f"trial_{int(row['trial_id']):04d}.json"
+            if trial_file.exists():
+                with open(trial_file, 'r') as f:
+                    trial_data = json.load(f)
+                
+                # Check if trial already exists in study
+                existing_trial = next((t for t in study.trials if t.number == trial_data['trial_id']), None)
+                if existing_trial is None:
+                    # Create a frozen trial and add it
+                    frozen_trial = FrozenTrial(
+                        number=trial_data['trial_id'],
+                        state=TrialState[trial_data['state']],
+                        params=trial_data['params'],
+                        user_attrs=trial_data['user_attrs'],
+                        system_attrs=trial_data['system_attrs'],
+                        value=trial_data['value'],
+                        datetime_start=None,
+                        datetime_complete=None,
+                        intermediate_values={},
+                        distributions={},
+                        trial_id=trial_data['trial_id'],
+                    )
+                    study.add_trial(frozen_trial)
+        
+        print(f"[green]✓ Loaded {len(study.trials)} trials from files[/]")
+
+    def save_trial_results(trial: Trial, settings: Settings, output_dir: Path = Path("trial_results")):
+        """Save trial results to disk for manual inspection/resume."""
+        output_dir.mkdir(exist_ok=True)
+        
+        trial_data = {
+            'trial_id': trial.number,
+            'user_attrs': dict(trial.user_attrs),
+            'params': trial.params,
+            'distributions': dict(trial.distributions),
+            'datetime': datetime.now().isoformat(),
+        }
+        
+        # Save individual trial
+        trial_file = output_dir / f"trial_{trial.number:04d}.json"
+        with open(trial_file, 'w') as f:
+            json.dump(trial_data, f, indent=2, default=str)
+        
+        # Update master summary
+        summary_file = output_dir / "trials_summary.csv"
+        
+        if summary_file.exists():
+            df = pd.read_csv(summary_file)
+        else:
+            df = pd.DataFrame()
+        
+        new_row = {
+            'trial_id': trial.number,
+            'index': trial.user_attrs.get('index', trial.number),
+            'kl_divergence': trial.user_attrs.get('kl_divergence', None),
+            'refusals': trial.user_attrs.get('refusals', None),
+            'direction_index': trial.user_attrs.get('direction_index', None),
+            'datetime': datetime.now().isoformat(),
+        }
+        
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        df.to_csv(summary_file, index=False)
+        
+        print(f"[grey50]Saved trial {trial.number} results[/]")
+
+
+    BACKUP_FILE = "trials_backup.pkl"
+
+    if os.path.exists(BACKUP_FILE):
+        try:
+            with open(BACKUP_FILE, "rb") as f:
+                existing_trials = pickle.load(f)
+            
+            # Convert to FrozenTrials and add to study
+            for i, trial_data in enumerate(existing_trials):
+                frozen_trial = optuna.trial.FrozenTrial(
+                    number=i,
+                    state=optuna.trial.TrialState.COMPLETE,
+                    value=trial_data.get('user_attrs', None),
+                    values=(trial_data['score'], trial_data.get('kl_divergence', 0)),
+                    params=trial_data['params'],
+                    distributions={},
+                    user_attrs=trial_data.get('user_attrs', {}),
+                    system_attrs=trial_data.get('system_attrs', {}),
+                    datetime_start=None,
+                    datetime_complete=None,
+                    intermediate_values={},
+                    trial_id=i+1,
+                )
+                study.add_trial(frozen_trial)
+            
+            print(f"[green]✓ Resumed {len(existing_trials)} trials[/]")
+        except Exception as e:
+            print(f"[yellow]Could not load backup: {e}[/]")
+
+    # Run optimization
     try:
         study.optimize(objective_wrapper, n_trials=settings.n_trials)
+        
+        # Backup after completion
+        completed_trials = []
+        for t in study.trials:
+            if t.state == TrialState.COMPLETE:
+                completed_trials.append({
+                    'params': t.params,
+                    'score': t.values[0] if t.values else None,
+                    'user_attrs': dict(t.user_attrs),
+                })
+        
+        with open(BACKUP_FILE, "wb") as f:
+            pickle.dump(completed_trials, f)
+            
     except KeyboardInterrupt:
-        # This additional handler takes care of the small chance that KeyboardInterrupt
-        # is raised just between trials, which wouldn't be caught by the handler
-        # defined in objective_wrapper above.
-        pass
+        # Backup on interrupt
+        print("\n[green]Backing up trials before exit...[/]")
+        completed_trials = []
+        for t in study.trials:
+            if t.state == TrialState.COMPLETE:
+                completed_trials.append({
+                    'params': t.params,
+                    'score': t.values[0] if t.values else None,
+                    'user_attrs': dict(t.user_attrs),
+                })
+        
+        with open(BACKUP_FILE, "wb") as f:
+            pickle.dump(completed_trials, f)
+        
+        raise Exception
 
     while True:
         # If no trials at all have been evaluated, the study must have been stopped
@@ -522,7 +789,7 @@ def run():
         )
 
         print()
-        print("[bold green]Optimization finished![/]")
+        print(f"[bold green]Optimization finished![/] at {datetime.now()}")
         print()
         print(
             (
@@ -560,17 +827,24 @@ def run():
                 return
 
             print()
-            print(f"Restoring model from trial [bold]{trial.user_attrs['index']}[/]...")
+            print(f"Restoring model from trial [bold]{trial.user_attrs['index']}[/] at {datetime.now()}...")
             print("* Parameters:")
             for name, value in get_trial_parameters(trial).items():
                 print(f"  * {name} = [bold]{value}[/]")
-            print("* Resetting model...")
+            print(f"* Resetting model at {datetime.now()}...")
             model.reset_model()
-            print("* Abliterating...")
+            print(f"* Abliterating at {datetime.now()}...")
+            
+            parameters_dict = trial.user_attrs["parameters"]
+            parameters_objects = {
+                component: AbliterationParameters(**params_dict)
+                for component, params_dict in parameters_dict.items()
+            }
+
             model.abliterate(
                 refusal_directions,
                 trial.user_attrs["direction_index"],
-                trial.user_attrs["parameters"],
+                parameters_objects,
             )
 
             while True:

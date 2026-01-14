@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
+# THIS IS src/heretic/evaluator.py
 
+import re
+from tqdm import tqdm
+from datetime import datetime
+
+import pickle
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -20,28 +26,37 @@ class Evaluator:
     def __init__(self, settings: Settings, model: Model):
         self.settings = settings
         self.model = model
+        pattern = r'\b(' + '|'.join(
+            re.escape(marker.lower()) 
+            for marker in settings.refusal_markers
+        ) + r')\b'
+        self.refusal_regex = re.compile(pattern)
+        self.has_recorded_initial_responses = False
+        self.load_prior = False
+
+
 
         print()
         print(
-            f"Loading good evaluation prompts from [bold]{settings.good_evaluation_prompts.dataset}[/]..."
+            f"Loading good evaluation prompts from [bold]{settings.good_evaluation_prompts.dataset} at {datetime.now()}[/]..."
         )
         self.good_prompts = load_prompts(settings, settings.good_evaluation_prompts)
-        print(f"* [bold]{len(self.good_prompts)}[/] prompts loaded")
+        print(f"* [bold]{len(self.good_prompts)}[/] prompts loaded at {datetime.now()}")
 
-        print("* Obtaining first-token probability distributions...")
+        print(f"* Obtaining first-token probability distributions at {datetime.now()}...")
         self.base_logprobs = model.get_logprobs_batched(self.good_prompts)
 
         print()
         print(
-            f"Loading bad evaluation prompts from [bold]{settings.bad_evaluation_prompts.dataset}[/]..."
+            f"Loading bad evaluation prompts from [bold]{settings.bad_evaluation_prompts.dataset} at {datetime.now()}[/]..."
         )
         self.bad_prompts = load_prompts(settings, settings.bad_evaluation_prompts)
-        print(f"* [bold]{len(self.bad_prompts)}[/] prompts loaded")
+        print(f"* [bold]{len(self.bad_prompts)}[/] prompts loaded at {datetime.now()}")
 
-        print("* Counting model refusals...")
+        print(f"* Counting model refusals at {datetime.now()}...")
         self.base_refusals = self.count_refusals()
         print(
-            f"* Initial refusals: [bold]{self.base_refusals}[/]/{len(self.bad_prompts)}"
+            f"* Initial refusals: [bold]{self.base_refusals}[/]/{len(self.bad_prompts)} at {datetime.now()}"
         )
 
     def is_refusal(self, response: str) -> bool:
@@ -50,29 +65,61 @@ class Evaluator:
             return True
 
         # Remove emphasis (e.g. "I *will not*...").
-        response = response.lower().replace("*", "")
+        #response = response.lower().replace("*", "")
+        #
+        ## Normalize typographic apostrophes ("won’t" -> "won't").
+        #response = response.replace("’", "'")
+        #
+        ## Normalize whitespace between words to a single space.
+        #response = " ".join(response.split())
 
-        # Normalize typographic apostrophes ("won’t" -> "won't").
-        response = response.replace("’", "'")
+        response = " ".join(
+            response.lower()
+            .replace("*", "")
+            .replace("’", "'")
+            .split()
+        )
 
-        # Normalize whitespace between words to a single space.
-        response = " ".join(response.split())
-
-        for marker in self.settings.refusal_markers:
-            if marker.lower() in response:
-                return True
-
-        return False
+        return bool(self.refusal_regex.search(response))
+        
+        #for marker in self.settings.refusal_markers:
+        #    if marker.lower() in response:
+        #        return True
+        #
+        #return False
 
     def count_refusals(self) -> int:
         refusal_count = 0
+        if not self.has_recorded_initial_responses:
+            if not self.load_prior:
+                print("[INFO] (We need to generate model responses first)")
+                responses = self.model.get_responses_batched(
+                    self.bad_prompts,
+                    skip_special_tokens=True,
+                )
+                print(f"Finished generating responses at {datetime.now()}")
+                
+                print(f"Saving responses...")
+                with open('dumps/responses.pkl', 'wb') as file:
+                    pickle.dump(responses, file)
+                print(f"[INFO] Responses have been saved to dumps/responses.pkl at {datetime.now()}; Comment out pickle dumping in src/heretic/evaluator.py and uncomment pickle loading if restarting/resuming.")
+                
+            else:
+                print(f"Loading responses at {datetime.now()}...")
+                with open('dumps/responses.pkl', 'rb') as file:
+                    responses = pickle.load(file)
+                print(f"Finished loading responses at {datetime.now()}...")
+            self.has_recorded_initial_responses = True
+        
+        else:
+            print("[INFO] (We need to generate model responses first)")
+            responses = self.model.get_responses_batched(
+                self.bad_prompts,
+                skip_special_tokens=True,
+            )
+            print(f"Finished generating responses at {datetime.now()}")
 
-        responses = self.model.get_responses_batched(
-            self.bad_prompts,
-            skip_special_tokens=True,
-        )
-
-        for prompt, response in zip(self.bad_prompts, responses):
+        for prompt, response in tqdm(zip(self.bad_prompts, responses), total=len(self.bad_prompts), desc="Counting Refusals"):
             is_refusal = self.is_refusal(response)
             if is_refusal:
                 refusal_count += 1
@@ -93,7 +140,7 @@ class Evaluator:
         return refusal_count
 
     def get_score(self) -> tuple[tuple[float, float], float, int]:
-        print("  * Obtaining first-token probability distributions...")
+        print(f"  * Obtaining first-token probability distributions at {datetime.now()}...")
         logprobs = self.model.get_logprobs_batched(self.good_prompts)
         kl_divergence = F.kl_div(
             logprobs,

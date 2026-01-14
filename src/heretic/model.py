@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
+# THIS IS src/heretic/model.py
+
 
 import math
 from contextlib import suppress
@@ -30,12 +32,42 @@ from .config import QuantizationMethod, Settings
 from .utils import Prompt, batchify, empty_cache, print
 
 
+
+from tqdm import tqdm
+from transformers import GPTQConfig
+try:
+    from auto_gptq import AutoGPTQForCausalLM
+    HAS_AUTO_GPTQ = True
+except ImportError:
+    HAS_AUTO_GPTQ = False
+try:
+    from gptqmodel import GPTQModel
+    HAS_GPTQMODEL = True
+except ImportError:
+    HAS_GPTQMODEL = False
 @dataclass
 class AbliterationParameters:
     max_weight: float
     max_weight_position: float
     min_weight: float
     min_weight_distance: float
+    
+    def to_dict(self) -> dict:
+        return {
+            "max_weight": self.max_weight,
+            "max_weight_position": self.max_weight_position,
+            "min_weight": self.min_weight,
+            "min_weight_distance": self.min_weight_distance,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> "AbliterationParameters":
+        return cls(
+            max_weight=data["max_weight"],
+            max_weight_position=data["max_weight_position"],
+            min_weight=data["min_weight"],
+            min_weight_distance=data["min_weight_distance"],
+        )
 
 
 class Model:
@@ -49,7 +81,6 @@ class Model:
 
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
-
         self.tokenizer = AutoTokenizer.from_pretrained(
             settings.model,
             trust_remote_code=settings.trust_remote_code,
@@ -75,35 +106,44 @@ class Model:
         if self.settings.evaluate_model is not None:
             self.trusted_models[settings.evaluate_model] = settings.trust_remote_code
 
-        for dtype in settings.dtypes:
-            print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
-
+        if self.settings.quantization == QuantizationMethod.GPTQ or self.settings.quantization == QuantizationMethod.AGPTQ:
             try:
-                quantization_config = self._get_quantization_config(dtype)
-
-                # Build kwargs, only include quantization_config if it's not None
-                # (some models like gpt-oss have issues with explicit None)
-                extra_kwargs = {}
-                if quantization_config is not None:
-                    extra_kwargs["quantization_config"] = quantization_config
-
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    settings.model,
-                    dtype=dtype,
-                    device_map=settings.device_map,
-                    max_memory=self.max_memory,
-                    trust_remote_code=self.trusted_models.get(settings.model),
-                    **extra_kwargs,
-                )
-
-                # If we reach this point and the model requires trust_remote_code,
-                # either the user accepted, or settings.trust_remote_code is True.
-                if self.trusted_models.get(settings.model) is None:
-                    self.trusted_models[settings.model] = True
-
-                # A test run can reveal dtype-related problems such as the infamous
-                # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
-                # (https://github.com/meta-llama/llama/issues/380).
+                try:
+                    from gptqmodel import GPTQModel
+                    HAS_GPTQMODEL = True
+                    print("gptqmodel installed")
+                except ImportError:
+                    HAS_GPTQMODEL = False
+                    print("gptqmodel NOT installed")
+                if self.settings.quantization == QuantizationMethod.GPTQ and HAS_GPTQMODEL:
+                    print(f"* Loading GPTQ model...")
+                    self.model = GPTQModel.load(
+                        settings.model,
+                        device_map=settings.device_map,
+                        max_memory=self.max_memory,
+                        trust_remote_code=self.trusted_models.get(settings.model),
+                        disable_exllama=False,  # Use exllama kernels if available
+                        use_triton=False,       # Disable Triton (Windows compatibility)
+                    )
+                    print("Successfully loaded GPTQ model")
+                if not HAS_GPTQMODEL or (self.settings.quantization == QuantizationMethod.AGPTQ and HAS_AUTO_GPTQ):
+                    print(f"* Loading GPTQ model ({self.settings.gptq_bits}-bit) via Auto-GPTQ...")
+                    self.model = AutoGPTQForCausalLM.from_quantized(
+                        settings.model,
+                        device_map=settings.device_map,
+                        max_memory=self.max_memory,
+                        trust_remote_code=self.trusted_models.get(settings.model),
+                        use_safetensors=True,
+                        disable_exllama=False,
+                        use_triton=False,
+                    )
+                    print("Successfully loaded Auto-GPTQ model")
+                
+                if (not HAS_GPTQMODEL and not HAS_AUTO_GPTQ) or self.model == None:
+                    print("NEITHER!!!!")
+                    raise ImportError("Neither gptqmodel nor auto-gptq is installed")
+                    
+                
                 self.generate(
                     [
                         Prompt(
@@ -113,20 +153,62 @@ class Model:
                     ],
                     max_new_tokens=1,
                 )
+                
+                print("[green]Ok[/]")
+                print(f"[bold green]Model loaded (GPTQ).[/]")
             except Exception as error:
                 self.model = None  # ty:ignore[invalid-assignment]
                 empty_cache()
-                print(f"[red]Failed[/] ({error})")
-                continue
+                print(f"[red]Failed to load GPTQ model[/] ({error})")
+                raise Exception(f"Failed to load GPTQ model: {error}")
+        else:
+            for dtype in settings.dtypes:
+                print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
 
-            print("[green]Ok[/]")
-            if settings.quantization == QuantizationMethod.BNB_4BIT:
-                print("[bold green]Model loaded in 4-bit precision.[/]")
-            break
+                try:
+                    quantization_config = self._get_quantization_config(dtype)
 
-        if self.model is None:
-            raise Exception("Failed to load model with all configured dtypes.")
+                    extra_kwargs = {}
+                    if quantization_config is not None:
+                        extra_kwargs["quantization_config"] = quantization_config
 
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        settings.model,
+                        torch_dtype=dtype,
+                        device_map=settings.device_map,
+                        max_memory=self.max_memory,
+                        trust_remote_code=self.trusted_models.get(settings.model),
+                        attn_implementation="flash_attention_2",
+                        **extra_kwargs,
+                    )
+
+                    if self.trusted_models.get(settings.model) is None:
+                        self.trusted_models[settings.model] = True
+
+                    # Test run
+                    self.generate(
+                        [
+                            Prompt(
+                                system=settings.system_prompt,
+                                user="What is 1+1?",
+                            )
+                        ],
+                        max_new_tokens=1,
+                    )
+                except Exception as error:
+                    self.model = None
+                    empty_cache()
+                    print(f"[red]Failed[/] ({error})")
+                    continue
+
+                print("[green]Ok[/]")
+                if settings.quantization == QuantizationMethod.BNB_4BIT:
+                    print("[bold green]Model loaded in 4-bit precision (BitsAndBytes).[/]")
+                break
+
+            if self.model is None:
+                raise Exception("Failed to load model with all configured dtypes.")
+        
         self._apply_lora()
 
         # LoRA B matrices are initialized to zero by default in PEFT,
@@ -140,37 +222,59 @@ class Model:
             )
 
     def _apply_lora(self):
-        # Guard against calling this method at the wrong time.
-        assert isinstance(self.model, PreTrainedModel)
+        is_qmodel = type(self.model).__name__.endswith('QModel')
+        
+        if is_qmodel:
+            # Get the INNER model (MistralForCausalLM), NOT the QModel wrapper
+            inner_model = self.model._modules['model']
+            
+            # Wrap ONLY the inner model with PEFT
+            target_modules = [comp.split(".")[-1] for comp in self._get_abliterable_components_from_model(inner_model)]
+            
+            peft_config = LoraConfig(
+                r=1,
+                target_modules=target_modules,
+                lora_alpha=1,
+                lora_dropout=0,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            
+            # Wrap the inner model, replace it in the QModel
+            peft_model = get_peft_model(inner_model, peft_config)
+            self.model._modules['model'] = peft_model
+        else:
+            # Non-GPTQ path - wrap self.model directly
+            target_modules = [comp.split(".")[-1] for comp in self.get_abliterable_components()]
+            
+            peft_config = LoraConfig(
+                r=1,
+                target_modules=target_modules,
+                lora_alpha=1,
+                lora_dropout=0,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            
+            self.model = get_peft_model(self.model, peft_config)
+        
+        print(f"[green]LoRA adapters initialized[/]")
 
-        # Always use LoRA adapters for abliteration (faster reload, no weight modification)
-        # We use the leaf names (e.g. "o_proj") as target modules.
-        # This may cause LoRA adapters to be attached to unrelated modules (e.g. "conv.o_proj"),
-        # but this is harmless as we only abliterate the modules we target in `abliterate()`,
-        # leaving the others at their default (identity) state.
-        # NOTE: This will need to be updated when hybrid layer support (#43) is merged.
-        target_modules = [
-            comp.split(".")[-1] for comp in self.get_abliterable_components()
-        ]
 
-        peft_config = LoraConfig(
-            r=1,  # Rank 1 is sufficient for directional ablation
-            target_modules=target_modules,
-            lora_alpha=1,
-            lora_dropout=0,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
+    def _get_abliterable_components_from_model(self, model) -> list[str]:
+        """Get abliterable components from an unwrapped model."""
+        # Find layers in the model
+        modules = model._modules
+        if 'model' in modules and 'layers' in modules['model']._modules:
+            layer = modules['model']._modules['layers']._modules['0']
+        elif 'layers' in modules:
+            layer = modules['layers']._modules['0']
+        else:
+            raise AttributeError("Cannot find layers")
+        
+        return ['attn.o_proj', 'mlp.down_proj']  # Or detect dynamically
 
-        # peft_config is a LoraConfig object rather than a dictionary,
-        # so the result is a PeftModel rather than a PeftMixedModel.
-        self.model = cast(PeftModel, get_peft_model(self.model, peft_config))
-
-        print(
-            f"[green]LoRA adapters initialized (targets: {', '.join(target_modules)})[/]"
-        )
-
-    def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
+    def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | GPTQConfig | None:
         """
         Creates quantization config based on settings.
 
@@ -178,7 +282,7 @@ class Model:
             dtype: The dtype string (e.g., "auto", "bfloat16")
 
         Returns:
-            BitsAndBytesConfig or None
+            BitsAndBytesConfig, GPTQConfig, or None
         """
         if self.settings.quantization == QuantizationMethod.BNB_4BIT:
             # BitsAndBytesConfig expects a torch.dtype, not a string.
@@ -193,14 +297,37 @@ class Model:
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
             )
+        
+        elif self.settings.quantization == QuantizationMethod.AGPTQ:
+            # Validate bits
+            if self.settings.gptq_bits not in [2, 3, 4, 8]:
+                raise ValueError(
+                    f"GPTQ bits must be 2, 3, 4, or 8. Got: {self.settings.gptq_bits}"
+                )
+            
+            return GPTQConfig(
+                bits=self.settings.gptq_bits,
+                group_size=self.settings.gptq_group_size,
+                desc_act=self.settings.gptq_desc_act,
+                disable_exllama=True,  # Better compatibility with LoRA
+            )
+        
         return None
 
     def get_merged_model(self) -> PreTrainedModel:
+        # Get the actual PEFT model (may be wrapped in QModel)
+        peft_model = self.model
+        is_qmodel = type(peft_model).__name__.endswith('QModel')
+        
+        if is_qmodel:
+            peft_model = peft_model.model
+            
         # Guard against calling this method at the wrong time.
-        assert isinstance(self.model, PeftModel)
+        if not isinstance(peft_model, PeftModel):
+            raise TypeError(f"Expected PeftModel, got {type(peft_model)}")
 
         # Check if we need special handling for quantized models
-        if self.settings.quantization == QuantizationMethod.BNB_4BIT:
+        if self.settings.quantization in [QuantizationMethod.BNB_4BIT, QuantizationMethod.GPTQ, QuantizationMethod.AGPTQ]:
             # Quantized models need special handling - we must reload the base model
             # in full precision to merge the LoRA adapters
 
@@ -209,6 +336,19 @@ class Model:
             for name, param in self.model.named_parameters():
                 if "lora_" in name:
                     adapter_state[name] = param.data.clone().cpu()
+
+            # For GPTQ, we can try to stay quantized during merge (less memory)
+            if self.settings.quantization == QuantizationMethod.GPTQ:
+                print("* Merging LoRA adapters (keeping GPTQ quantization)...")
+                # GPTQ models can often merge in-place without full dequantization
+                try:
+                    merged_model = peft_model.merge_and_unload()
+                    self.needs_reload = True
+                    return merged_model
+                except Exception as e:
+                    print(f"[yellow]In-place merge failed: {e}[/]")
+                    print("[yellow]Falling back to full reload method...[/]")
+
 
             # Load base model in full precision on CPU to avoid VRAM issues
             print("* Loading base model on CPU (this may take a while)...")
@@ -245,7 +385,7 @@ class Model:
         else:
             # Non-quantized model - can merge directly
             print("* Merging LoRA adapters into base model...")
-            merged_model = self.model.merge_and_unload()
+            merged_model = peft_model.merge_and_unload()
             # merge_and_unload() modifies self.model in-place, destroying LoRA adapters.
             # Mark for full reload if user switches trials later.
             self.needs_reload = True
@@ -261,53 +401,148 @@ class Model:
         - Slow path: If switching models or after merge_and_unload(),
           performs full model reload with quantization config.
         """
-        current_model = getattr(self.model.config, "name_or_path", None)
+        is_qmodel = type(self.model).__name__.endswith('QModel')
+        inner_model = self.model.model if is_qmodel else self.model
+        current_model = getattr(inner_model.config if hasattr(inner_model, 'config') else self.model, "name_or_path", None)
+       
         if current_model == self.settings.model and not self.needs_reload:
             # Reset LoRA adapters to zero (identity transformation)
-            for name, module in self.model.named_modules():
+            model_to_reset = inner_model
+            
+            for name, module in model_to_reset.named_modules():
                 if "lora_B" in name and hasattr(module, "weight"):
                     torch.nn.init.zeros_(module.weight)
             return
-
-        dtype = self.model.dtype
 
         # Purge existing model object from memory to make space.
         self.model = None  # ty:ignore[invalid-assignment]
         empty_cache()
 
-        quantization_config = self._get_quantization_config(str(dtype).split(".")[-1])
+        # Special handling for GPTQ
+        if self.settings.quantization == QuantizationMethod.GPTQ or self.settings.quantization.AGPTQ:
+            try:
+                from gptqmodel import GPTQModel
+                HAS_GPTQMODEL = True
+            except ImportError:
+                HAS_GPTQMODEL = False
+            
+            if HAS_GPTQMODEL:
+                self.model = GPTQModel.load(
+                    self.settings.model,
+                    device_map=self.settings.device_map,
+                    max_memory=self.max_memory,
+                    offload_buffers=True,
+                    trust_remote_code=self.trusted_models.get(self.settings.model),
+                )
+            elif HAS_AUTO_GPTQ:
+                self.model = AutoGPTQForCausalLM.from_quantized(
+                    self.settings.model,
+                    device_map=self.settings.device_map,
+                    max_memory=self.max_memory,
+                    trust_remote_code=self.trusted_models.get(self.settings.model),
+                    use_safetensors=True,
+                )
+            else:
+                raise ImportError("Neither gptqmodel nor auto-gptq is installed")
+        else:
+            # Non-GPTQ models
+            dtype = self.model.dtype if hasattr(self, 'model') and self.model else torch.bfloat16
+            quantization_config = self._get_quantization_config(str(dtype).split(".")[-1])
 
-        # Build kwargs, only include quantization_config if it's not None
-        extra_kwargs = {}
-        if quantization_config is not None:
-            extra_kwargs["quantization_config"] = quantization_config
+            extra_kwargs = {}
+            if quantization_config is not None:
+                extra_kwargs["quantization_config"] = quantization_config
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.settings.model,
-            dtype=dtype,
-            device_map=self.settings.device_map,
-            max_memory=self.max_memory,
-            trust_remote_code=self.trusted_models.get(self.settings.model),
-            **extra_kwargs,
-        )
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.settings.model,
+                torch_dtype=dtype,
+                device_map=self.settings.device_map,
+                max_memory=self.max_memory,
+                trust_remote_code=self.trusted_models.get(self.settings.model),
+                attn_implementation="flash_attention_2",
+                **extra_kwargs,
+            )
 
         self._apply_lora()
-
         self.needs_reload = False
 
+    def debug_model_structure(self):
+        """Print model structure for debugging."""
+        def print_modules(obj, prefix="", depth=0, max_depth=4):
+            if depth > max_depth:
+                return
+            print(f"{prefix}Type: {type(obj).__name__}")
+            
+            # Check _modules dict
+            modules = getattr(obj, '_modules', None)
+            if modules:
+                print(f"{prefix}_modules keys: {list(modules.keys())}")
+                for key, val in modules.items():
+                    if key in ('layers', 'model', 'base_model', 'language_model'):
+                        print(f"{prefix}  [{key}] ->")
+                        print_modules(val, prefix + "    ", depth + 1, max_depth)
+            
+            # Check specific attributes without triggering __getattr__
+            for attr in ['model', 'base_model', 'layers']:
+                if attr in dir(obj.__class__):  # Only check if it's a real attribute
+                    try:
+                        val = object.__getattribute__(obj, attr)
+                        print(f"{prefix}.{attr} (direct): {type(val).__name__}")
+                    except:
+                        pass
+        
+        print("=" * 60)
+        print("MODEL STRUCTURE DEBUG:")
+        print("=" * 60)
+        print_modules(self.model)
+        print("=" * 60)
+
+
     def get_layers(self) -> ModuleList:
+        #print("WE RAN")
+        #self.debug_model_structure()
         model = self.model
 
-        # Unwrap PeftModel (always true after _apply_lora)
+        # For gptqmodel's quantized models, the structure is:
+        # LlamaQModel._modules['model'] -> (possibly PeftModel) -> MistralForCausalLM
+        if type(model).__name__.endswith('QModel'):
+            if hasattr(model, '_modules') and 'model' in model._modules:
+                model = model._modules['model']
+
+        # Unwrap PeftModel (if present after _apply_lora)
         if isinstance(model, PeftModel):
             model = model.base_model.model
 
-        # Most multimodal models.
-        with suppress(Exception):
-            return model.model.language_model.layers
+        # Try direct _modules access ONLY (avoid __getattr__ recursion)
+        def get_via_modules(obj, *keys):
+            """Safely traverse _modules dict without triggering __getattr__"""
+            for key in keys:
+                modules = getattr(obj, '_modules', None)
+                if modules is None or key not in modules:
+                    return None
+                obj = modules[key]
+            return obj
 
-        # Text-only models.
-        return model.model.layers
+        # 1. Try: model._modules['model']._modules['layers']
+        layers = get_via_modules(model, 'model', 'layers')
+        if isinstance(layers, ModuleList):
+            return layers
+
+        # 2. Try: model._modules['layers']
+        layers = get_via_modules(model, 'layers')
+        if isinstance(layers, ModuleList):
+            return layers
+
+        # 3. Try: model._modules['model']._modules['language_model']._modules['layers']
+        layers = get_via_modules(model, 'model', 'language_model', 'layers')
+        if isinstance(layers, ModuleList):
+            return layers
+
+        raise AttributeError(
+            f"Could not locate transformer layers. "
+            f"Model type: {type(model).__name__}, "
+            f"Self.model type: {type(self.model).__name__}"
+        )
 
     def get_layer_modules(self, layer_index: int) -> dict[str, list[Module]]:
         layer = self.get_layers()[layer_index]
@@ -358,6 +593,22 @@ class Model:
         assert total_modules > 0, "No abliterable modules found in layer"
 
         return modules
+
+    
+    def debug_quantlinear(self, module):
+        """Debug GPTQ TorchQuantLinear structure."""
+        print(f"Type: {type(module).__name__}")
+        print(f"Attributes: {[a for a in dir(module) if not a.startswith('_')]}")
+        
+        # Common GPTQ weight storage attributes
+        for attr in ['qweight', 'qzeros', 'scales', 'g_idx', 'bias', 'weight']:
+            if hasattr(module, attr):
+                val = getattr(module, attr)
+                if hasattr(val, 'shape'):
+                    print(f"  {attr}: shape={val.shape}, dtype={val.dtype}")
+                else:
+                    print(f"  {attr}: {type(val)}")
+
 
     def get_abliterable_components(self) -> list[str]:
         return list(self.get_layer_modules(0).keys())
@@ -433,22 +684,36 @@ class Model:
                     # FIXME: This cast is valid only under the assumption that the original
                     #        module wrapped by the LoRA adapter has a weight attribute.
                     #        See the comment above for why this is currently not guaranteed.
-                    base_weight = cast(Tensor, module.base_layer.weight)
-                    quant_state = getattr(base_weight, "quant_state", None)
+                    #self.debug_quantlinear(module.base_layer)
+                    base_layer = module.base_layer
 
-                    if quant_state is None:
-                        W = base_weight.to(torch.float32)
+                    # Check if it's a GPTQ quantized layer
+                    if hasattr(base_layer, 'dequantize_weight'):
+                        # GPTQ quantized layer
+                        W = base_layer.dequantize_weight().to(torch.float32)
+                    elif hasattr(base_layer, 'weight'):
+                        base_weight = base_layer.weight
+                        quant_state = getattr(base_weight, "quant_state", None)
+                        
+                        if quant_state is None:
+                            W = base_weight.to(torch.float32)
+                        else:
+                            # BitsAndBytes 4-bit quantization
+                            W = cast(
+                                Tensor,
+                                bnb.functional.dequantize_4bit(
+                                    base_weight.data,
+                                    quant_state,
+                                ).to(torch.float32),
+                            )
                     else:
-                        # 4-bit quantization.
-                        # This cast is always valid. Type inference fails here because the
-                        # bnb.functional module is not found by ty for some reason.
-                        W = cast(
-                            Tensor,
-                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
-                                base_weight.data,
-                                quant_state,
-                            ).to(torch.float32),
+                        raise AttributeError(
+                            f"Cannot get weights from {type(base_layer).__name__}. "
+                            f"No 'weight' or 'dequantize_weight' found."
                         )
+
+                    if W.shape[0] != v.shape[0]:
+                        W = W.T
 
                     # Calculate lora_A = v^T W
                     # v is (d_out,), W is (d_out, d_in)
@@ -539,7 +804,9 @@ class Model:
     ) -> list[str]:
         responses = []
 
-        for batch in batchify(prompts, self.settings.batch_size):
+        batches = batchify(prompts, self.settings.batch_size)
+        for batch in tqdm(batches, desc="Generating Response Batch"):
+        #for batch in batchify(prompts, self.settings.batch_size):
             for response in self.get_responses(
                 batch,
                 skip_special_tokens=skip_special_tokens,
@@ -580,12 +847,27 @@ class Model:
         return residuals.to(torch.float32)
 
     def get_residuals_batched(self, prompts: list[Prompt]) -> Tensor:
-        residuals = []
+        batches = batchify(prompts, self.settings.batch_size)
+        first_batch_residuals = self.get_residuals(batches[0])
+        n_prompts = len(prompts)
+        n_layers, n_components = first_batch_residuals.shape[1], first_batch_residuals.shape[2]
+        
+        # Pre-allocate on CPU to avoid GPU memory fragmentation
+        result = torch.empty(
+            (n_prompts, n_layers, n_components),
+            dtype=torch.float32,
+            device='cpu'
+        )
+        result[:len(batches[0])] = first_batch_residuals.cpu()
+        offset = len(batches[0])
+        
+        for batch in tqdm(batches[1:], initial=1, total=len(batches), desc="Processing Residuals"):
+            batch_residuals = self.get_residuals(batch)
+            batch_size = len(batch)
+            result[offset:offset + batch_size] = batch_residuals.cpu()
+            offset += batch_size
 
-        for batch in batchify(prompts, self.settings.batch_size):
-            residuals.append(self.get_residuals(batch))
-
-        return torch.cat(residuals, dim=0)
+        return result
 
     # We work with logprobs rather than probabilities for numerical stability
     # when computing the KL divergence.
@@ -611,12 +893,26 @@ class Model:
         return F.log_softmax(logits, dim=-1)
 
     def get_logprobs_batched(self, prompts: list[Prompt]) -> Tensor:
-        logprobs = []
-
-        for batch in batchify(prompts, self.settings.batch_size):
-            logprobs.append(self.get_logprobs(batch))
-
-        return torch.cat(logprobs, dim=0)
+        batches = batchify(prompts, self.settings.batch_size)
+        first_batch_logprobs = self.get_logprobs(batches[0])
+        n_prompts = len(prompts)
+        vocab_size = first_batch_logprobs.shape[1]
+        
+        # Pre-allocate on CPU to avoid GPU memory fragmentation
+        result = torch.empty(
+            (n_prompts, vocab_size),
+            dtype=torch.float32,
+            device='cpu'
+        )
+        result[:len(batches[0])] = first_batch_logprobs.cpu()
+        offset = len(batches[0])
+        
+        for batch in tqdm(batches[1:], initial=1, total=len(batches), desc="Processing LogProbs"):
+            batch_logprobs = self.get_logprobs(batch)
+            batch_size = len(batch)
+            result[offset:offset + batch_size] = batch_logprobs.cpu()
+            offset += batch_size
+        return result
 
     def stream_chat_response(self, chat: list[dict[str, str]]) -> str:
         # This cast is valid because str is the return type

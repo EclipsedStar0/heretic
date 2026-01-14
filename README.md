@@ -1,3 +1,63 @@
+# THIS IS A 'FORK' WITH A NUMBER OF CHANGES
+- **THIS IS NOT, AND WILL NOT, BE ACTIVELY MAINTAINED**
+- - **ANYONE IS FREE TO TAKE THE CHANGES MADE FROM THIS REPOSITORY, AND USE THEM TO BETTER THE MAIN REPOSITORY (P-E-W/HERETIC)**
+- **DO NOT REPORT ISSUES STEMMING FROM THIS REPOSITORY IN P-E-W/HERETIC**
+- **THIS WAS MADE WITH RESPECT TO WINDOWS 11**
+- **A NUMBER OF THE CHANGES MADE, WERE MADE UTILIZING ASSISTANCE FROM THE LLMS: DEEPSEEK, MINIMAX 2.1, AND CLAUDE**
+
+---
+
+POSSIBLY BREAKING CHANGES:
+- In abliterate at src/heretic/main.py, uses a transpose to fix a matrix-multiplication error from wrong dimensions when trying to use a gptqmodel (line 721)
+
+New imports:
+- os
+- datetime 
+- pickle
+- json
+- pandas 
+- re
+- tqdm 
+- auto_gptq (optional)
+- gptqmodel (optional)
+
+Iffy Changes:
+- Modifies get_residuals_batched in src/heretic/model.py from Line 854-875 (preallocates residual tensors in one-go instead of incrementally; moves them onto cpu) 
+- (effectively same as get_residuals_batched but for get_logprobs_batched at Line 900-920 of src/heretic/model.py)
+
+Touches a fair number of functions to be able to properly get GPTQ models
+- Ex. get_layers from Line 506-550 as GPTQ models have a different layout
+- Ex. get_merged_model for GPTQ models (Line 322-329)
+- A lot more that would take a fair bit to list out (mainly src/heretic/main.py and src/heretic/model.py)
+
+QOL Changes:
+- Lots of printing the current timestamp to better monitor when things began / progress for long running trials
+- Uses tqdm for a nice progress bar for LogProbs, Residuals, Getting Responses, and Counting Refusals
+- Ability to save the prefix_responses as a .pkl file (line 311 and 312 in src/heretic/main.py), and the ability to then load those responses in (Line 313-315), letting you skip some of the warmup if you haven't changed models or prompts
+- Ability to save the good and bad residuals as torch .pt files in src/heretic/main.py (line 364 for good and line 369 for bad); To load it in is line 365 for good and line 370 for bad.
+- Saves initial refusal responses (before you get residuals), allowing you to skip some of the warmup; To LOAD, change self.load_prior at line 35 in src/heretic/evaluator.py from False to True
+- Uses a regex pattern with refusals lowercased on initiation, rather than a for loop and lowercasing refusal markers each time when checking for refusals
+- Allows the usage of GPTQ quantized models (both from gptqmodel and auto_gptq), (so now you can use more than just FP16 or 4-bit)
+- Allows saving/resuming abliteration trials at will
+
+New Config Parameters:
+- gptq (auto_gptq) and local-gptq (gptqmodel) as quantization options
+- gptq_bits
+- gptq_group_size
+- gptq_desc_act
+- study_name (what should be loaded in/resumed)
+- storage (url for optuna)
+- load_existing_study (true/false)
+- resume_trials (true/false)
+
+(not really important cause the studies will be saved each abliteration trial)
+- checkpoint_dir (directory to hold trial checkpoints for manual resuming)
+- checkpoint_interval (save checkpoints every N abliteration trials)
+
+---
+
+**(Readme for https://github.com/p-e-w/heretic below)**
+
 # Heretic: Fully automatic censorship removal for language models
 
 [![Discord](https://img.shields.io/discord/1447831134212984903?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=for-the-badge)](https://discord.gg/gdXc48gSyT)

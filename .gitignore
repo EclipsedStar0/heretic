@@ -17,3 +17,10 @@ wheels/
 
 # Configuration files
 /config.toml
+
+/dumps
+/models
+/plots
+/trial_results
+trials_backup.pkl
+heretic_trials.db
